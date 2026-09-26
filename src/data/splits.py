@@ -64,5 +64,5 @@ def make_or_load_splits(
         "test": sorted(int(i) for i in tst),
     }
     save_path.parent.mkdir(parents=True, exist_ok=True)
-    save_path.write_text(json.dumps(result, indent=1))
+    save_path.write_text(json.dumps(result, separators=(",", ":")) + "\n")
     return result
