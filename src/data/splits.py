@@ -1,63 +1,68 @@
-# src/data/splits.py
+"""Frozen, stratified train / validation / test splits.
+
+Indices are written to JSON together with a fingerprint of the data, so a later
+run on a *different* file (or a re-cleaned file) regenerates the split instead of
+silently reusing row numbers that now point at different patients.
+"""
+
+from __future__ import annotations
+
+import hashlib
 import json
+import logging
 from pathlib import Path
+
 import pandas as pd
-from sklearn.model_selection import StratifiedShuffleSplit
+from sklearn.model_selection import train_test_split
+
+log = logging.getLogger(__name__)
+
+
+def data_fingerprint(df: pd.DataFrame) -> str:
+    h = pd.util.hash_pandas_object(df, index=True).to_numpy()
+    return hashlib.sha256(h.tobytes()).hexdigest()[:16]
 
 
 def make_or_load_splits(
     df: pd.DataFrame,
-    time_col: str,
-    event_col: str,
-    stage_col: str,
     save_path: Path,
+    event_col: str = "event",
+    stratify_col: str | None = "stage_6th",
     seed: int = 7,
-):
-    """
-    Create (or load) frozen indices for train/val/test.
+    val_size: float = 0.15,
+    test_size: float = 0.15,
+) -> dict:
+    save_path = Path(save_path)
+    fp = data_fingerprint(df)
 
-    Strategy:
-    - stratify on a combination of clinical stage (if present) and event,
-      so each split has similar outcome distribution and stage mix.
-    - 70% train
-    - remaining 30% is split 50/50 into val and test (so 15/15)
-    - write to JSON so future runs use the exact same rows
-    """
-    # if we already created them once, just reuse
     if save_path.exists():
-        return json.loads(save_path.read_text())
+        saved = json.loads(save_path.read_text())
+        if saved.get("fingerprint") == fp:
+            return saved
+        log.warning("Data changed since %s was written - regenerating splits.", save_path)
 
-    # build stratification label
-    if stage_col in df.columns:
-        stage = df[stage_col].fillna("Unknown").astype(str)
-    else:
-        stage = pd.Series(["All"] * len(df), index=df.index)
+    strat = df[event_col].astype(str)
+    if stratify_col and stratify_col in df.columns:
+        strat = df[stratify_col].fillna("Unknown").astype(str) + "_" + strat
+    # Merge strata too small to split into a catch-all bucket.
+    counts = strat.value_counts()
+    strat = strat.where(~strat.isin(counts[counts < 10].index), "rare_" + df[event_col].astype(str))
 
-    event = df[event_col].astype(int)
-    strat = stage.astype(str) + "_" + event.astype(str)
-
-    # first split: 70% train, 30% temp
-    sss1 = StratifiedShuffleSplit(n_splits=1, test_size=0.30, random_state=seed)
-    trn_idx, tmp_idx = next(sss1.split(df, strat))
-
-    # second split: temp -> 50% val, 50% test (i.e. 15% / 15% of original)
-    tmp = df.iloc[tmp_idx]
-    strat_tmp = strat.iloc[tmp_idx]
-
-    sss2 = StratifiedShuffleSplit(n_splits=1, test_size=0.50, random_state=seed)
-    val_rel, tst_rel = next(sss2.split(tmp, strat_tmp))
-    val_idx = tmp.index[val_rel].to_list()
-    tst_idx = tmp.index[tst_rel].to_list()
+    idx = df.index.to_numpy()
+    trn, tmp = train_test_split(idx, test_size=val_size + test_size, stratify=strat, random_state=seed)
+    val, tst = train_test_split(
+        tmp, test_size=test_size / (val_size + test_size), stratify=strat.loc[tmp], random_state=seed
+    )
 
     result = {
-        "train": df.index[trn_idx].to_list(),
-        "val": val_idx,
-        "test": tst_idx,
+        "fingerprint": fp,
         "seed": seed,
-        "stratified_on": [event_col, stage_col],
-        "split_ratio": {"train": 0.70, "val": 0.15, "test": 0.15},
+        "stratified_on": [c for c in (stratify_col, event_col) if c and c in df.columns],
+        "sizes": {"train": len(trn), "val": len(val), "test": len(tst)},
+        "train": sorted(int(i) for i in trn),
+        "val": sorted(int(i) for i in val),
+        "test": sorted(int(i) for i in tst),
     }
-
-    # save so all future runs are identical
-    save_path.write_text(json.dumps(result, indent=2))
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    save_path.write_text(json.dumps(result, indent=1))
     return result
