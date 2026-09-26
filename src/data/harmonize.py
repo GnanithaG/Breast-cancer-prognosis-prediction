@@ -58,6 +58,11 @@ def harmonize_registry_codes(df: pd.DataFrame) -> pd.DataFrame:
         if col in df.columns:
             df.loc[df[col] < 0, col] = float("nan")
 
+    # 'differentiation' is a 1:1 relabelling of grade (Well=1 ... Undifferentiated=4).
+    # Keeping both splits one effect across two columns and muddles the hazard ratios.
+    if {"grade", "differentiation"} <= set(df.columns):
+        df = df.drop(columns=["differentiation"])
+
     # Positive nodes can't exceed nodes examined.
     if {"regional_node_positive", "regional_node_examined"} <= set(df.columns):
         df["regional_node_positive"] = df[["regional_node_positive", "regional_node_examined"]].min(axis=1)

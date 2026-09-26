@@ -11,6 +11,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
+import pandas as pd  # noqa: E402
 from sksurv.metrics import brier_score, cumulative_dynamic_auc  # noqa: E402
 from sksurv.nonparametric import kaplan_meier_estimator  # noqa: E402
 
@@ -136,3 +137,65 @@ def save_all(models, labels, best, y_train, X_test, y_test, horizons, importance
     plot_calibration(models[best], labels[best], X_test, y_test, horizons, figdir / "calibration.png")
     plot_km_by_risk(models[best], labels[best], X_test, y_test, figdir / "km_by_risk_group.png")
     plot_importance(importance, labels[best], figdir / "permutation_importance.png")
+
+
+def plot_shap_summary(shap_df, X, label, path, max_features=12):
+    """Beeswarm-style summary: one row per variable, one dot per patient."""
+    order = shap_df.abs().mean().sort_values(ascending=True).index[-max_features:]
+    fig, ax = plt.subplots(figsize=(7.5, 0.42 * len(order) + 1.2))
+    rng = np.random.default_rng(0)
+    cmap = plt.get_cmap("coolwarm")
+    for i, col in enumerate(order):
+        vals = shap_df[col].to_numpy()
+        jitter = rng.uniform(-0.28, 0.28, len(vals))
+        if pd.api.types.is_numeric_dtype(X[col]):
+            v = X[col].rank(pct=True).to_numpy()
+            ax.scatter(vals, i + jitter, c=cmap(v), s=6, alpha=0.7, linewidths=0)
+        else:
+            ax.scatter(vals, i + jitter, color="#64748b", s=6, alpha=0.5, linewidths=0)
+    ax.axvline(0, color=GREY, lw=1)
+    ax.set_yticks(range(len(order)), [f"{c}  ({shap_df[c].abs().mean():.2f})" for c in order])
+    ax.set(
+        xlabel="Contribution to log-hazard (SHAP), right = higher risk.  (n) = mean |SHAP|",
+        title=f"What drives predicted risk: {label}",
+    )
+    ax.grid(axis="y", visible=False)
+    sm = plt.cm.ScalarMappable(cmap=cmap)
+    cb = fig.colorbar(sm, ax=ax, fraction=0.03, pad=0.02, ticks=[0, 1])
+    cb.ax.set_yticklabels(["low", "high"])
+    cb.set_label("Numeric value (grey = categorical)", fontsize=8)
+    fig.savefig(path)
+    plt.close(fig)
+
+
+def plot_patient_waterfall(contrib, x_row, title, path, top=8):
+    """Horizontal waterfall for one patient's SHAP values (log-hazard units)."""
+    s = contrib.reindex(contrib.abs().sort_values(ascending=False).index)
+    head, rest = s.iloc[:top], s.iloc[top:]
+
+    def fmt(v):
+        return f"{v:g}" if isinstance(v, float) else str(v)
+
+    items = [(f"{k} = {fmt(x_row[k])}", v) for k, v in head.items()]
+    if len(rest):
+        items.append((f"{len(rest)} other variables", rest.sum()))
+    n = len(items)
+    fig, ax = plt.subplots(figsize=(7.5, 0.42 * n + 1.4))
+    total = 0.0
+    for idx, (_, v) in enumerate(items):  # largest first, drawn from the top down
+        y = n - 1 - idx
+        ax.barh(y, v, left=total, color="#dc2626" if v > 0 else "#2563eb", height=0.6)
+        end = total + v
+        ax.text(
+            end + (0.02 if v >= 0 else -0.02), y, f"{v:+.2f}", va="center", ha="left" if v >= 0 else "right", fontsize=8
+        )
+        total = end
+    ax.set_yticks(range(n), [name for name, _ in items][::-1])
+    ax.axvline(0, color=GREY, lw=1)
+    ax.set(
+        xlabel=f"Log-hazard vs average patient (total {total:+.2f}  =  {np.exp(total):.1f}x the average hazard)",
+        title=title,
+    )
+    ax.grid(axis="y", visible=False)
+    fig.savefig(path)
+    plt.close(fig)

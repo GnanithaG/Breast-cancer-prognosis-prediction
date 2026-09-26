@@ -8,7 +8,6 @@ from src.data.ingest import coerce_event, load_csv, to_snake
 from src.data.splits import make_or_load_splits
 from src.evaluation.metrics import evaluate_model, km_survival_at, valid_horizons
 from src.models.registry import MODELS, fit_and_tune
-from src.preprocessing.pipeline import build_preprocessor
 
 # ---------- ingest ----------
 
@@ -103,10 +102,56 @@ def test_end_to_end_cox_beats_chance(tmp_path, clean_df):
     parts = {k: clean_df.loc[s[k]] for k in ("train", "val", "test")}
     X = {k: v.drop(columns=["time", "event"]) for k, v in parts.items()}
     y = {k: Surv.from_arrays(v.event.astype(bool), v.time.astype(float)) for k, v in parts.items()}
-    model, info = fit_and_tune(
-        MODELS["cox"], build_preprocessor(X["train"]), X["train"], y["train"], X["val"], y["val"], tau=60
-    )
+    model, info = fit_and_tune(MODELS["cox"], X["train"], y["train"], X["val"], y["val"], tau=60)
     m = evaluate_model(model, y["train"], X["test"], y["test"], [24, 60], n_boot=0)
     assert m["c_index_uno"] > 0.6
     assert m["ibs_skill_vs_km"] > 0
     assert 0 < m["by_horizon"]["60"]["brier"] < 0.25
+
+
+# ---------- baseline, explanations, serving ----------
+
+
+def test_stage_baseline_uses_only_stage(tmp_path, clean_df):
+    s = make_or_load_splits(clean_df, tmp_path / "s.json")
+    tr, va = clean_df.loc[s["train"]], clean_df.loc[s["val"]]
+    X_tr, X_va = tr.drop(columns=["time", "event"]), va.drop(columns=["time", "event"])
+    y_tr = Surv.from_arrays(tr.event.astype(bool), tr.time.astype(float))
+    y_va = Surv.from_arrays(va.event.astype(bool), va.time.astype(float))
+    model, _ = fit_and_tune(MODELS["stage"], X_tr, y_tr, X_va, y_va, tau=60)
+    changed = X_va.copy()
+    changed["age"] = 30  # a non-stage column must not affect the prediction
+    np.testing.assert_allclose(model.predict(X_va), model.predict(changed))
+
+
+def test_linear_shap_sums_to_risk_difference(serving):
+    from src.evaluation.explain import linear_shap
+
+    X = serving.X_train.iloc[:20]
+    phi = linear_shap(serving.model, X, serving.X_train)
+    expected = serving.model.predict(X) - serving.model.predict(serving.X_train).mean()
+    np.testing.assert_allclose(phi.sum(axis=1), expected, atol=1e-8)
+
+
+def test_hazard_ratio_reference_is_one(serving):
+    from src.evaluation.explain import hazard_ratios
+
+    hr = hazard_ratios(serving.model, serving.X_train)
+    refs = hr[hr.level.str.contains("reference")]
+    assert len(refs) > 0 and np.allclose(refs.hazard_ratio, 1.0)
+
+
+def test_stage_from_tn_matches_data(clean_df):
+    from src.models.serving import stage_from_tn
+
+    derived = [stage_from_tn(t, n) for t, n in zip(clean_df.t_stage, clean_df.n_stage, strict=True)]
+    assert derived == clean_df.stage_6th.tolist()
+
+
+def test_serving_prediction_is_sane(serving):
+    inputs = serving.X_train.iloc[0].to_dict()
+    X = serving.complete(inputs)
+    out = serving.predict(X, [12, 60, 96])
+    assert np.all(np.diff(out["survival"]) <= 0) and 0 < out["survival"][-1] <= 1
+    assert out["risk_group"] in {"Lowest", "Low-mid", "High-mid", "Highest"}
+    assert serving.test_c_index > 0.65

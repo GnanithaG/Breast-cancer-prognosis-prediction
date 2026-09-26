@@ -18,3 +18,14 @@ def raw_csv():
 @pytest.fixture(scope="session")
 def clean_df(raw_csv):
     return harmonize_registry_codes(load_csv(raw_csv))
+
+
+@pytest.fixture(scope="session")
+def serving(tmp_path_factory):
+    from src.models.serving import build_serving_model
+
+    return build_serving_model(
+        data=ROOT / "data" / "Breast_Cancer.csv",
+        splits=tmp_path_factory.mktemp("s") / "splits.json",
+        metrics=ROOT / "reports" / "metrics.json",
+    )

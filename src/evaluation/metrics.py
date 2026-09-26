@@ -134,3 +134,40 @@ def evaluate_models(models: dict, y_train, X_test, y_test, horizons, n_boot=200,
         log.info("Evaluating %s on the test set", name)
         out[name] = evaluate_model(model, y_train, X_test, y_test, horizons, n_boot=n_boot, seed=seed)
     return out
+
+
+def paired_c_index_difference(y_train, y_test, risk_a, risk_b, tau, n_boot=500, seed=7) -> dict:
+    """Uno's C of model A minus model B on the same test patients, with a paired bootstrap CI.
+
+    Resampling the *same* patients for both models removes most of the noise that makes
+    the separate confidence intervals overlap, so this is the right test for "is A better than B?".
+    """
+    c_a = concordance_index_ipcw(y_train, y_test, risk_a, tau=tau)[0]
+    c_b = concordance_index_ipcw(y_train, y_test, risk_b, tau=tau)[0]
+    rng = np.random.default_rng(seed)
+    diffs = []
+    n = len(y_test)
+    for _ in range(n_boot):
+        b = rng.integers(0, n, n)
+        yb = y_test[b]
+        if yb["event"].sum() < 2 or yb["time"].max() <= tau:
+            continue
+        try:
+            diffs.append(
+                concordance_index_ipcw(y_train, yb, risk_a[b], tau=tau)[0]
+                - concordance_index_ipcw(y_train, yb, risk_b[b], tau=tau)[0]
+            )
+        except ValueError:
+            continue
+    diffs = np.array(diffs)
+    lo, hi = np.percentile(diffs, [2.5, 97.5]) if len(diffs) >= 20 else (np.nan, np.nan)
+    # Two-sided bootstrap p-value: how often the difference falls on the other side of zero.
+    p = float(min(1.0, 2 * min((diffs <= 0).mean(), (diffs >= 0).mean()))) if len(diffs) else float("nan")
+    return {
+        "c_a": float(c_a),
+        "c_b": float(c_b),
+        "difference": float(c_a - c_b),
+        "ci95": [float(lo), float(hi)],
+        "p_value": p,
+        "n_bootstrap": int(len(diffs)),
+    }

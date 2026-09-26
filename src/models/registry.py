@@ -21,6 +21,8 @@ from sksurv.ensemble import GradientBoostingSurvivalAnalysis, RandomSurvivalFore
 from sksurv.linear_model import CoxPHSurvivalAnalysis
 from sksurv.metrics import concordance_index_ipcw
 
+from src.preprocessing.pipeline import build_preprocessor
+
 log = logging.getLogger(__name__)
 
 
@@ -32,9 +34,19 @@ class ModelSpec:
     grid: dict[str, list] = field(default_factory=dict)
     fixed: dict[str, Any] = field(default_factory=dict)
     seeded: bool = False
+    features: list[str] | None = None  # restrict to these columns (None = all)
+    baseline: bool = False  # reference model, never picked as "best"
 
 
 MODELS: dict[str, ModelSpec] = {
+    "stage": ModelSpec(
+        name="stage",
+        label="AJCC stage only (baseline)",
+        factory=CoxPHSurvivalAnalysis,
+        fixed={"alpha": 0.01},
+        features=["stage_6th"],
+        baseline=True,
+    ),
     "cox": ModelSpec(
         name="cox",
         label="Cox PH (ridge)",
@@ -68,7 +80,6 @@ def _param_grid(grid: dict[str, list]):
 
 def fit_and_tune(
     spec: ModelSpec,
-    preprocessor,
     X_train,
     y_train,
     X_val,
@@ -77,6 +88,7 @@ def fit_and_tune(
     tau: float | None = None,
 ) -> tuple[Pipeline, dict]:
     """Try every grid point, keep the best on validation Uno's C, return it fitted on train."""
+    preprocessor = build_preprocessor(X_train[spec.features] if spec.features else X_train)
     best = (-np.inf, None, None)
     tried = []
     for params in _param_grid(spec.grid) if spec.grid else [{}]:
