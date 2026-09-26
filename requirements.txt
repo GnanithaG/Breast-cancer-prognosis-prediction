@@ -1,9 +1,6 @@
+numpy>=1.26
 pandas>=2.2
-numpy>=2.0
-pyarrow>=16.0
-scikit-learn>=1.4
+scikit-learn>=1.6
+scikit-survival>=0.24
 matplotlib>=3.8
-lifelines>=0.27
-scikit-survival>=0.25
-# optional (only if you want to implement DeepSurv later):
-# torch
+tabulate>=0.9

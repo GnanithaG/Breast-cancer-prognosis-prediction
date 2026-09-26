@@ -1,99 +1,136 @@
+"""Censoring-aware evaluation of survival models.
+
+Metrics (all computed on the held-out TEST split):
+  * Harrell's C-index            - classic ranking accuracy
+  * Uno's C-index (IPCW)         - ranking accuracy corrected for censoring, truncated at tau
+  * time-dependent AUC(t)        - can the model separate who dies by t from who survives past t
+  * Brier score(t) (IPCW)        - calibration + discrimination of the predicted probability at t
+  * Integrated Brier score (IBS) - Brier averaged over follow-up
+  * IBS skill vs Kaplan-Meier    - 1 - IBS_model / IBS_KM; > 0 means better than a no-covariate model
+95% CIs for the headline numbers come from a non-parametric bootstrap of the test set.
+"""
+
+from __future__ import annotations
+
+import logging
+
 import numpy as np
-from sksurv.metrics import concordance_index_censored, integrated_brier_score
+from sksurv.metrics import (
+    brier_score,
+    concordance_index_censored,
+    concordance_index_ipcw,
+    cumulative_dynamic_auc,
+    integrated_brier_score,
+)
+from sksurv.nonparametric import kaplan_meier_estimator
+
+log = logging.getLogger(__name__)
 
 
-def _risk_scores(model, X):
-    try:
-        return model.predict(X)
-    except Exception:
-        surv_funcs = model.predict_survival_function(X)
-        return np.array([-fn.x[-1] for fn in surv_funcs])
+def survival_at(model, X, times) -> np.ndarray:
+    """Predicted S(t | x) for each row of X at each time in ``times`` -> (n, len(times))."""
+    times = np.asarray(times, dtype=float)
+    fns = model.predict_survival_function(X)
+    out = np.empty((len(fns), len(times)))
+    for i, fn in enumerate(fns):
+        lo, hi = fn.domain
+        out[i] = fn(np.clip(times, lo, hi))
+    return out
 
 
-def _survival_probs_at_times(model, X, times):
-    surv_funcs = model.predict_survival_function(X)
-    result = []
-    for fn in surv_funcs:
-        probs = []
-        for t in times:
-            if t <= fn.x[0]:
-                probs.append(float(fn.y[0]))
-            elif t >= fn.x[-1]:
-                probs.append(float(fn.y[-1]))
-            else:
-                probs.append(float(fn(t)))
-        result.append(probs)
-    return np.array(result)
+def km_survival_at(y_train, times) -> np.ndarray:
+    """Kaplan-Meier survival curve from the training set evaluated at ``times``."""
+    t, s = kaplan_meier_estimator(y_train["event"], y_train["time"])
+    idx = np.searchsorted(t, times, side="right") - 1
+    return np.where(idx >= 0, s[np.clip(idx, 0, None)], 1.0)
 
 
-def evaluate_models(
-    models,
-    X_train,
-    y_train,
-    X_val,
-    y_val,
-    X_test,
-    y_test,
-    horizons,
-):
-    metrics = {}
+def valid_horizons(horizons, y_train, y_test) -> np.ndarray:
+    """Keep horizons strictly inside the follow-up range of both train and test."""
+    upper = min(y_train["time"].max(), y_test["time"].max())
+    lower = max(y_train["time"].min(), y_test["time"].min())
+    keep = np.array([h for h in horizons if lower < h < upper], dtype=float)
+    dropped = sorted(set(map(float, horizons)) - set(keep))
+    if dropped:
+        log.warning("Dropping horizons outside follow-up range (%.0f-%.0f months): %s", lower, upper, dropped)
+    if len(keep) == 0:
+        raise ValueError("No evaluation horizon falls inside the follow-up range.")
+    return keep
 
-    for name, model in models.items():
-        print(f"[metrics] Evaluating {name}")
 
-        risk = _risk_scores(model, X_test)
-        cindex = concordance_index_censored(
-            y_test["event"],
-            y_test["time"],
-            risk,
-        )[0]
+def ibs_grid(y_test, tau: float, n: int = 50) -> np.ndarray:
+    lo = np.percentile(y_test["time"], 5)
+    return np.linspace(lo, tau, n)
 
-        model_metrics = {
-            "c_index_ipcw": float(cindex),
-            "by_horizon": {},
-        }
 
+def _core(y_train, y_test, risk, surv_grid, grid, tau):
+    c_uno = concordance_index_ipcw(y_train, y_test, risk, tau=tau)[0]
+    ibs = integrated_brier_score(y_train, y_test, surv_grid, grid)
+    return c_uno, ibs
+
+
+def evaluate_model(model, y_train, X_test, y_test, horizons, n_boot=200, seed=7) -> dict:
+    horizons = np.asarray(horizons, dtype=float)
+    tau = float(horizons.max())
+    grid = ibs_grid(y_test, tau)
+
+    risk = model.predict(X_test)
+    surv_h = survival_at(model, X_test, horizons)
+    surv_grid = survival_at(model, X_test, grid)
+
+    c_harrell = concordance_index_censored(y_test["event"], y_test["time"], risk)[0]
+    c_uno, ibs = _core(y_train, y_test, risk, surv_grid, grid, tau)
+    auc_t, mean_auc = cumulative_dynamic_auc(y_train, y_test, risk, horizons)
+    _, brier_t = brier_score(y_train, y_test, surv_h, horizons)
+
+    km_grid = np.tile(km_survival_at(y_train, grid), (len(y_test), 1))
+    ibs_km = integrated_brier_score(y_train, y_test, km_grid, grid)
+
+    # Bootstrap the test set for CIs on the headline metrics.
+    rng = np.random.default_rng(seed)
+    boots = []
+    n = len(y_test)
+    for _ in range(n_boot):
+        b = rng.integers(0, n, n)
+        yb = y_test[b]
+        if yb["event"].sum() < 2 or yb["time"].max() <= tau:
+            continue
         try:
-            surv_probs = _survival_probs_at_times(model, X_test, horizons)
-            train_times = y_train["time"]
+            boots.append(_core(y_train, yb, risk[b], surv_grid[b], grid, tau))
+        except ValueError:
+            continue
+    boots = np.array(boots)
 
-            valid_horizons = [
-                h for h in horizons
-                if h > float(np.min(train_times)) and h < float(np.max(train_times))
-            ]
+    def ci(col):
+        if len(boots) < 20:
+            return [None, None]
+        return [float(v) for v in np.percentile(boots[:, col], [2.5, 97.5])]
 
-            if len(valid_horizons) >= 2:
-                surv_probs_valid = _survival_probs_at_times(model, X_test, valid_horizons)
-                ibs = integrated_brier_score(
-                    y_train,
-                    y_test,
-                    surv_probs_valid,
-                    np.array(valid_horizons),
-                )
-                model_metrics["ibs"] = float(ibs)
-            else:
-                model_metrics["ibs"] = None
+    return {
+        "c_index_harrell": float(c_harrell),
+        "c_index_uno": float(c_uno),
+        "c_index_uno_ci95": ci(0),
+        "tau_months": tau,
+        "mean_auc": float(mean_auc),
+        "ibs": float(ibs),
+        "ibs_ci95": ci(1),
+        "ibs_kaplan_meier": float(ibs_km),
+        "ibs_skill_vs_km": float(1 - ibs / ibs_km),
+        "n_bootstrap": int(len(boots)),
+        "by_horizon": {
+            str(int(h)): {
+                "auc": float(auc_t[i]),
+                "brier": float(brier_t[i]),
+                "mean_predicted_risk": float(np.mean(1 - surv_h[:, i])),
+            }
+            for i, h in enumerate(horizons)
+        },
+    }
 
-            for i, h in enumerate(horizons):
-                failure_prob = 1.0 - surv_probs[:, i]
-                observed_event = ((y_test["time"] <= h) & (y_test["event"])).astype(int)
-                brier = np.mean((observed_event - failure_prob) ** 2)
 
-                model_metrics["by_horizon"][str(int(h))] = {
-                    "cindex": float(cindex),
-                    "brier": float(brier),
-                    "mean_predicted_risk": float(np.mean(failure_prob)),
-                }
-
-        except Exception as e:
-            print(f"[metrics] Horizon metrics failed for {name}: {e}")
-            for h in horizons:
-                model_metrics["by_horizon"][str(int(h))] = {
-                    "cindex": float(cindex),
-                    "brier": None,
-                    "mean_predicted_risk": None,
-                }
-
-        metrics[name] = model_metrics
-
-    return metrics
+def evaluate_models(models: dict, y_train, X_test, y_test, horizons, n_boot=200, seed=7) -> dict:
+    out = {}
+    for name, model in models.items():
+        log.info("Evaluating %s on the test set", name)
+        out[name] = evaluate_model(model, y_train, X_test, y_test, horizons, n_boot=n_boot, seed=seed)
+    return out
