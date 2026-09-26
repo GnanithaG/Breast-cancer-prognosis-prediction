@@ -1,6 +1,17 @@
+# Python
 .venv/
+venv/
 __pycache__/
-*.pyc
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+
+# Notebooks / editors
 .ipynb_checkpoints/
+.vscode/
+.idea/
+
+# OS
 .DS_Store
 Thumbs.db

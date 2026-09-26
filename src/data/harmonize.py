@@ -1,47 +1,65 @@
+"""Clean up clinical coding so categories are consistent.
+
+Written against the column names produced by :func:`src.data.ingest.load_csv`
+(snake_case). Anything not present is simply skipped.
+"""
+
+from __future__ import annotations
+
 import pandas as pd
 
-def _norm_stage(s):
-    if pd.isna(s): return "Unknown"
-    s = str(s).strip().upper().replace("STAGE ", "")
-    if s.startswith("IIB"):  # collapse all finer T/N into broad stages
-        return "II"
-    if s.startswith("IIIB") or s.startswith("IIIC"):
-        return "III"
-    if s.startswith("II"): return "II"
-    if s.startswith("III"): return "III"
-    if s.startswith("IV"): return "IV"
-    if s.startswith("I"): return "I"
-    return "Unknown"
+RECEPTOR_COLS = ("estrogen_status", "progesterone_status", "er_status", "pr_status", "her2_status")
+NON_NEGATIVE_COLS = ("age", "tumor_size", "regional_node_examined", "regional_node_positive")
 
-def _norm_receptor(v):
-    if pd.isna(v): return "Unknown"
+
+def norm_receptor(v) -> str:
+    if pd.isna(v):
+        return "Unknown"
     v = str(v).strip().lower()
-    if v in ("pos","positive","1","true","yes"): return "Positive"
-    if v in ("neg","negative","0","false","no"): return "Negative"
+    if v in {"pos", "positive", "1", "true", "yes", "+"}:
+        return "Positive"
+    if v in {"neg", "negative", "0", "false", "no", "-"}:
+        return "Negative"
     return "Unknown"
 
-def _norm_grade(g):
-    if pd.isna(g): return "Unknown"
-    g = str(g).strip().upper().replace("GRADE", "").strip()
-    if g in {"1","2","3","4"}: return g
-    if g in {"I","II","III","IV"}:
-        return {"I":"1","II":"2","III":"3","IV":"4"}[g]
+
+def norm_grade(g) -> str:
+    """'3' -> '3', 'Grade II' -> '2', ' anaplastic; Grade IV' -> '4'."""
+    if pd.isna(g):
+        return "Unknown"
+    s = str(g).strip().upper()
+    if "ANAPLASTIC" in s:
+        return "4"
+    s = s.replace("GRADE", "").strip(" ;")
+    roman = {"I": "1", "II": "2", "III": "3", "IV": "4"}
+    if s in roman:
+        return roman[s]
+    if s in {"1", "2", "3", "4"}:
+        return s
     return "Unknown"
 
-def harmonize_registry_codes(df: pd.DataFrame, stage_col: str = "stage") -> pd.DataFrame:
+
+def harmonize_registry_codes(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-    if stage_col in df.columns:
-        df[stage_col] = df[stage_col].map(_norm_stage)
-    for col in ("er_status","pr_status","her2_status"):
+
+    # Trim stray whitespace in every text column.
+    for col in df.columns:
+        if not pd.api.types.is_numeric_dtype(df[col]):
+            df[col] = df[col].astype("string").str.strip().astype(object)
+
+    for col in RECEPTOR_COLS:
         if col in df.columns:
-            df[col] = df[col].map(_norm_receptor)
+            df[col] = df[col].map(norm_receptor)
+
     if "grade" in df.columns:
-        df["grade"] = df["grade"].map(_norm_grade)
-    # sanitize numeric non-negativity for common fields
-    for num_col in ("age","tumor_size","nodes_positive","nodes_examined","survival_months"):
-        if num_col in df.columns:
-            df.loc[df[num_col] < 0, num_col] = None
-    # keep nodes_positive <= nodes_examined
-    if "nodes_positive" in df.columns and "nodes_examined" in df.columns:
-        df["nodes_positive"] = df[["nodes_positive","nodes_examined"]].min(axis=1)
+        df["grade"] = df["grade"].map(norm_grade)
+
+    for col in NON_NEGATIVE_COLS:
+        if col in df.columns:
+            df.loc[df[col] < 0, col] = float("nan")
+
+    # Positive nodes can't exceed nodes examined.
+    if {"regional_node_positive", "regional_node_examined"} <= set(df.columns):
+        df["regional_node_positive"] = df[["regional_node_positive", "regional_node_examined"]].min(axis=1)
+
     return df
